@@ -13,7 +13,10 @@ app.use(express.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
 const uri = process.env.MONGO_URI;
-const client = new MongoClient(uri, { useNewUrlParser: true, useUnifiedTopology: true });
+const client = new MongoClient(uri, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+});
 
 const DISTANCE_LIMIT = 100;
 
@@ -30,10 +33,11 @@ connectMongoDB();
 
 app.post('/register-token', async (req, res) => {
   const { token, experienceId } = req.body;
-
   if (!token || !experienceId) {
     return res.status(400).send('Token and experienceId are required');
   }
+
+  console.log('Expo Push Token registered:', token, 'with experienceId:', experienceId);
 
   try {
     const collection = client.db("ultrasense").collection("push_tokens");
@@ -63,7 +67,7 @@ app.post('/distance', async (req, res) => {
     await collection.insertOne({ distance, timestamp: new Date() });
 
     if (distance >= DISTANCE_LIMIT) {
-      await sendPushNotification(distance);
+      await sendPushNotifications(distance);
     }
 
     res.send('✅ Distance processed and stored');
@@ -76,38 +80,37 @@ app.post('/distance', async (req, res) => {
 app.get('/latest-distance', async (req, res) => {
   try {
     const collection = client.db("ultrasense").collection("distance_data");
-    const latestData = await collection.find().sort({ timestamp: -1 }).limit(1).toArray();
+    const latest = await collection.find().sort({ timestamp: -1 }).limit(1).toArray();
 
-    if (latestData.length === 0) {
-      return res.status(404).send('No distance data yet');
+    if (latest.length === 0) {
+      return res.status(404).send('No data');
     }
 
-    res.json({ distance: latestData[0].distance });
+    res.json({ distance: latest[0].distance });
   } catch (error) {
-    console.error('❌ Error fetching latest distance:', error);
+    console.error('❌ Error fetching distance:', error);
     res.status(500).send('Internal server error');
   }
 });
 
-async function sendPushNotification(distance) {
+async function sendPushNotifications(distance) {
   const tokens = await client.db("ultrasense").collection("push_tokens").find().toArray();
-  const groupedByExperience = tokens.reduce((acc, tokenDoc) => {
-    const group = tokenDoc.experienceId || 'unknown';
-    if (!acc[group]) acc[group] = [];
-    acc[group].push(tokenDoc.token);
+
+  // Group tokens by experienceId
+  const grouped = tokens.reduce((acc, { token, experienceId }) => {
+    acc[experienceId] = acc[experienceId] || [];
+    acc[experienceId].push(token);
     return acc;
   }, {});
 
-  for (const experienceId in groupedByExperience) {
-    const tokenList = groupedByExperience[experienceId];
-    const messages = tokenList.map((token) => ({
+  for (const [experienceId, tokenList] of Object.entries(grouped)) {
+    const messages = tokenList.map(token => ({
       to: token,
       sound: 'default',
       title: '🚨 Distance Alert!',
       body: `Object detected at ${distance.toFixed(2)} cm.`,
-      priority: "high",
-      vibrate: [0, 250, 250, 250],
       data: { distance },
+      _experienceId: experienceId
     }));
 
     try {
@@ -125,10 +128,10 @@ async function sendPushNotification(distance) {
       console.log(`📤 Push notification response for ${experienceId}:`, data);
 
       if (data.errors) {
-        console.error('❌ Error sending push notification:', data.errors);
+        console.error('❌ Notification errors:', data.errors);
       }
-    } catch (error) {
-      console.error('❌ Error sending push notification:', error);
+    } catch (err) {
+      console.error(`❌ Error sending push to ${experienceId}:`, err);
     }
   }
 }
