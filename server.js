@@ -17,7 +17,6 @@ app.use(bodyParser.urlencoded({ extended: true }));
 const uri = process.env.MONGO_URI;
 const client = new MongoClient(uri, { useNewUrlParser: true, useUnifiedTopology: true });
 
-let expoPushToken = null;
 const DISTANCE_LIMIT = 100; // Distance limit in cm
 
 // Connect to MongoDB Atlas
@@ -40,12 +39,15 @@ app.post('/register-token', async (req, res) => {
     return res.status(400).send('Token is required');
   }
 
-  expoPushToken = token;
   console.log('Expo Push Token registered:', token);  // Log received token
 
   try {
     const collection = client.db("ultrasense").collection("push_tokens");
-    await collection.insertOne({ token, registeredAt: new Date() });
+    await collection.updateOne(
+      { token },
+      { $set: { token, registeredAt: new Date() } },
+      { upsert: true } // Add new token or update existing token
+    );
     res.send('✅ Token received and stored');
   } catch (error) {
     console.error('❌ Error storing token:', error);
@@ -68,9 +70,9 @@ app.post('/distance', async (req, res) => {
     await collection.insertOne({ distance, timestamp: new Date() });
 
     // If distance exceeds the limit, send push notification
-    if (distance >= DISTANCE_LIMIT && expoPushToken) {
+    if (distance >= DISTANCE_LIMIT) {
       console.log('🚨 Distance limit crossed! Sending notification...');
-      await sendPushNotification(expoPushToken, distance);
+      await sendPushNotification(distance);
     }
 
     res.send('✅ Distance processed and stored');
@@ -98,18 +100,20 @@ app.get('/latest-distance', async (req, res) => {
 });
 
 // Send push notification function
-async function sendPushNotification(token, distance) {
-  const message = {
-    to: token,
+async function sendPushNotification(distance) {
+  const tokens = await client.db("ultrasense").collection("push_tokens").find().toArray();
+
+  const messages = tokens.map((tokenDoc) => ({
+    to: tokenDoc.token,
     sound: 'default',
     title: '🚨 Distance Alert!',
     body: `Object detected at ${distance.toFixed(2)} cm.`,
     priority: "high",
     vibrate: [0, 250, 250, 250],
     data: { distance },
-  };
+  }));
 
-  console.log('Sending push notification with message:', message);  // Log the message
+  console.log('Sending push notifications to:', messages.length, 'tokens');
 
   try {
     const response = await fetch('https://exp.host/--/api/v2/push/send', {
@@ -119,11 +123,11 @@ async function sendPushNotification(token, distance) {
         'Accept-Encoding': 'gzip, deflate',
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify(message),
+      body: JSON.stringify(messages),
     });
 
     const data = await response.json();
-    console.log('📤 Push notification response:', data);  // Log Expo response
+    console.log('📤 Push notification response:', data);
 
     if (data.errors) {
       console.error('❌ Error sending push notification:', data.errors);
