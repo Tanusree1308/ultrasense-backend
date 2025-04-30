@@ -1,141 +1,100 @@
-require('dotenv').config();
 const express = require('express');
-const cors = require('cors');
-const fetch = require('node-fetch');
 const bodyParser = require('body-parser');
 const { MongoClient } = require('mongodb');
+const { Expo } = require('expo-server-sdk');
+const cors = require('cors');
+require('dotenv').config();
 
 const app = express();
-const port = 3001;
+const port = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json());
-app.use(bodyParser.urlencoded({ extended: true }));
+app.use(bodyParser.json());
 
-const uri = process.env.MONGO_URI;
-const client = new MongoClient(uri, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-});
+const expo = new Expo();
+const MONGO_URI = process.env.MONGO_URI;
 
-const DISTANCE_LIMIT = 100;
+let db, tokensCollection, distancesCollection;
 
-async function connectMongoDB() {
-  try {
-    await client.connect();
-    console.log("✅ Connected to MongoDB Atlas");
-  } catch (err) {
-    console.error('❌ MongoDB connection error:', err);
-    process.exit(1);
-  }
-}
-connectMongoDB();
+MongoClient.connect(MONGO_URI)
+  .then((client) => {
+    db = client.db('ultrasense');
+    tokensCollection = db.collection('push_tokens');
+    distancesCollection = db.collection('distances');
+    app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
+  })
+  .catch((err) => console.error('❌ MongoDB connection error:', err));
 
 app.post('/register-token', async (req, res) => {
   const { token, experienceId } = req.body;
-  if (!token || !experienceId) {
-    return res.status(400).send('Token and experienceId are required');
-  }
-
-  console.log('Expo Push Token registered:', token, 'with experienceId:', experienceId);
+  if (!token || !experienceId) return res.status(400).send('Missing token or experienceId');
 
   try {
-    const collection = client.db("ultrasense").collection("push_tokens");
-    await collection.updateOne(
+    await tokensCollection.updateOne(
       { token },
       { $set: { token, experienceId, registeredAt: new Date() } },
       { upsert: true }
     );
-    res.send('✅ Token received and stored');
-  } catch (error) {
-    console.error('❌ Error storing token:', error);
-    res.status(500).send('Error storing token');
+    res.send('✅ Token registered');
+  } catch (err) {
+    console.error('❌ Error registering token:', err);
+    res.status(500).send('Error registering token');
   }
 });
 
-app.post('/distance', async (req, res) => {
+app.post('/send-distance', async (req, res) => {
   const { distance } = req.body;
-
-  if (distance == null || isNaN(distance)) {
-    return res.status(400).send('Invalid distance value');
-  }
-
-  console.log(`📏 Distance received: ${distance} cm`);
+  if (typeof distance !== 'number') return res.status(400).send('Invalid distance');
 
   try {
-    const collection = client.db("ultrasense").collection("distance_data");
-    await collection.insertOne({ distance, timestamp: new Date() });
+    await distancesCollection.insertOne({ distance, createdAt: new Date() });
 
-    if (distance >= DISTANCE_LIMIT) {
-      await sendPushNotifications(distance);
+    if (distance > 100) {
+      const allTokens = await tokensCollection.find({}).toArray();
+
+      const grouped = allTokens.reduce((acc, { token, experienceId }) => {
+        if (!acc[experienceId]) acc[experienceId] = [];
+        acc[experienceId].push(token);
+        return acc;
+      }, {});
+
+      for (const [experienceId, tokens] of Object.entries(grouped)) {
+        const messages = tokens.map((pushToken) => {
+          if (!Expo.isExpoPushToken(pushToken)) return null;
+          return {
+            to: pushToken,
+            sound: 'default',
+            body: `Alert 🚨 Distance too high: ${distance.toFixed(2)} cm!`,
+            data: { distance },
+            _experienceId: experienceId
+          };
+        }).filter(Boolean);
+
+        const chunks = expo.chunkPushNotifications(messages);
+        for (const chunk of chunks) {
+          try {
+            const response = await expo.sendPushNotificationsAsync(chunk);
+            console.log(`📤 Push notification response for ${experienceId}:`, response);
+          } catch (err) {
+            console.error('❌ Error sending push notification:', err);
+          }
+        }
+      }
     }
 
-    res.send('✅ Distance processed and stored');
-  } catch (error) {
-    console.error('❌ Error storing distance data:', error);
-    res.status(500).send('Error storing distance data');
+    res.send('📏 Distance received');
+  } catch (err) {
+    console.error('❌ Error storing distance:', err);
+    res.status(500).send('Error storing distance');
   }
 });
 
 app.get('/latest-distance', async (req, res) => {
   try {
-    const collection = client.db("ultrasense").collection("distance_data");
-    const latest = await collection.find().sort({ timestamp: -1 }).limit(1).toArray();
-
-    if (latest.length === 0) {
-      return res.status(404).send('No data');
-    }
-
-    res.json({ distance: latest[0].distance });
-  } catch (error) {
-    console.error('❌ Error fetching distance:', error);
-    res.status(500).send('Internal server error');
+    const latest = await distancesCollection.find().sort({ createdAt: -1 }).limit(1).toArray();
+    res.json(latest[0] || { distance: null });
+  } catch (err) {
+    res.status(500).send('Error fetching distance');
   }
 });
 
-async function sendPushNotifications(distance) {
-  const tokens = await client.db("ultrasense").collection("push_tokens").find().toArray();
-
-  // Group tokens by experienceId
-  const grouped = tokens.reduce((acc, { token, experienceId }) => {
-    acc[experienceId] = acc[experienceId] || [];
-    acc[experienceId].push(token);
-    return acc;
-  }, {});
-
-  for (const [experienceId, tokenList] of Object.entries(grouped)) {
-    const messages = tokenList.map(token => ({
-      to: token,
-      sound: 'default',
-      title: '🚨 Distance Alert!',
-      body: `Object detected at ${distance.toFixed(2)} cm.`,
-      data: { distance },
-      _experienceId: experienceId
-    }));
-
-    try {
-      const response = await fetch('https://exp.host/--/api/v2/push/send', {
-        method: 'POST',
-        headers: {
-          Accept: 'application/json',
-          'Accept-Encoding': 'gzip, deflate',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(messages),
-      });
-
-      const data = await response.json();
-      console.log(`📤 Push notification response for ${experienceId}:`, data);
-
-      if (data.errors) {
-        console.error('❌ Notification errors:', data.errors);
-      }
-    } catch (err) {
-      console.error(`❌ Error sending push to ${experienceId}:`, err);
-    }
-  }
-}
-
-app.listen(port, '0.0.0.0', () => {
-  console.log(`🚀 Server running at http://0.0.0.0:${port}`);
-});
